@@ -1,0 +1,638 @@
+# ---- Libraries -------------------------------------------------------------
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+bioc_pkgs <- c("limma", "clusterProfiler", "EnhancedVolcano", "org.Hs.eg.db", "DOSE",
+               "GSVA", "progeny", "decoupleR", "OmnipathR")
+cran_pkgs <- c("readxl", "ggplot2", "pheatmap", "ggrepel", "dplyr",
+               "tidyr", "RColorBrewer", "msigdbr")   
+
+to_install_bioc <- bioc_pkgs[!vapply(bioc_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+to_install_cran <- cran_pkgs[!vapply(cran_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+
+if (length(to_install_cran)) install.packages(to_install_cran)
+if (length(to_install_bioc)) BiocManager::install(to_install_bioc, update = FALSE)
+
+if (!requireNamespace("msigdbdf", quietly = TRUE))
+  install.packages("msigdbdf", repos = "https://igordot.r-universe.dev")
+
+library(readxl)
+library(limma)
+library(ggplot2)
+library(pheatmap)
+library(ggrepel)
+library(dplyr)
+library(tidyr)
+library(RColorBrewer)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(DOSE)
+library(msigdbr)     
+library(GSVA)        
+library(progeny)     
+library(decoupleR)   
+
+set.seed(42)
+
+# ============================================================================
+# 1. DATA LOADING AND PREPARATION
+# ============================================================================
+MA <- read_excel("MA.xlsx")
+View(MA)
+
+# Columns 1-30 are expression; 1-17 = Group 0 (No Stressor), 18-29 = Group 1.
+new_names <- c(paste0("0_", 1:17), paste0("1_", 1:12))
+
+expr_matrix <- as.matrix(MA[, 1:29])
+expr_matrix <- matrix(as.numeric(expr_matrix),
+                      nrow = nrow(expr_matrix),
+                      ncol = ncol(expr_matrix))
+rownames(expr_matrix) <- paste0("Gene_", seq_len(nrow(expr_matrix)))
+colnames(expr_matrix) <- new_names
+
+# Gene annotation (probe-level)
+gene_info <- data.frame(
+  Gene_Symbol = ifelse(is.na(MA$`Gene Symbol`) | MA$`Gene Symbol` == "",
+                       "Unknown", MA$`Gene Symbol`),
+  Description = ifelse(is.na(MA$Description) | MA$Description == "",
+                       "No description", MA$Description),
+  stringsAsFactors = FALSE
+)
+rownames(gene_info) <- rownames(expr_matrix)
+
+# Sample metadata (unpaired: 17 vs 12).
+meta <- as.data.frame(read_excel("MA_metadata.xlsx"))
+stopifnot(setequal(colnames(expr_matrix), meta$Sample))    
+meta <- meta[match(colnames(expr_matrix), meta$Sample), ]   # reorder to column order
+stopifnot(identical(colnames(expr_matrix), meta$Sample))    # order locked
+sample_metadata <- meta
+sample_metadata$Group <- factor(sample_metadata$Group, levels = c("No_Stressor", "With_Stressor"))
+group <- sample_metadata$Group
+
+cat("Genes:", nrow(expr_matrix), " Samples:", ncol(expr_matrix), "\n")
+cat("No Stressor:", sum(group == "No_Stressor"),
+    " With Stressor:", sum(group == "With_Stressor"), "\n")
+
+cat(sprintf("Value range: [%.2f, %.2f]  | NAs: %d\n",
+            min(expr_matrix, na.rm = TRUE), max(expr_matrix, na.rm = TRUE),
+            sum(is.na(expr_matrix))))
+
+# ----------------------------------------------------------------------------
+# Symbol-level matrix for the methods that key on gene SYMBOLS
+# (GSVA / PROGENy / decoupleR). Drops Unknown probes and collapses multiple
+# probes per gene by averaging (limma::avereps).
+# ----------------------------------------------------------------------------
+keep_sym  <- !(gene_info$Gene_Symbol %in% c("Unknown", "", NA))
+expr_sym  <- expr_matrix[keep_sym, , drop = FALSE]
+rownames(expr_sym) <- gene_info$Gene_Symbol[keep_sym]
+expr_sym  <- avereps(expr_sym)            # collapse duplicate symbols
+cat("Symbol-level matrix:", nrow(expr_sym), "unique genes\n")
+
+# ============================================================================
+# 2. QUALITY CONTROL AND EXPLORATORY ANALYSIS
+# ============================================================================
+grp_col <- ifelse(group == "No_Stressor", "lightblue", "coral")
+
+pdf("01_expression_distribution.pdf", width = 12, height = 6)
+par(mfrow = c(1, 2))
+boxplot(expr_matrix, las = 2, col = grp_col,
+        main = "Expression Distribution by Sample",
+        ylab = "Log2 Expression", cex.axis = 0.6)
+legend("topright", legend = c("No Stressor", "With Stressor"),
+       fill = c("lightblue", "coral"))
+
+plot(density(expr_matrix[, 1], na.rm = TRUE), main = "Expression Value Distribution",
+     xlab = "Log2 Expression", xlim = range(expr_matrix, na.rm = TRUE), ylim = c(0, 2))
+for (i in 2:ncol(expr_matrix)) {
+  lines(density(expr_matrix[, i], na.rm = TRUE),
+        col = ifelse(group[i] == "No_Stressor", "blue", "red"))
+}
+legend("topright", legend = c("No Stressor", "With Stressor"),
+       col = c("blue", "red"), lty = 1)
+dev.off()
+
+# 2B. PCA
+pca_keep   <- apply(expr_matrix, 1, function(x) !anyNA(x) && sd(x) > 0)
+pca_result <- prcomp(t(expr_matrix[pca_keep, ]), scale. = TRUE)
+var_explained <- round(100 * summary(pca_result)$importance[2, ], 1)
+pca_data <- data.frame(PC1 = pca_result$x[, 1], PC2 = pca_result$x[, 2],
+                       Group = group, Sample = sample_metadata$Sample)
+
+pdf("02_PCA_plot.pdf", width = 10, height = 8)
+print(
+  ggplot(pca_data, aes(PC1, PC2, color = Group, label = Sample)) +
+    geom_point(size = 4, alpha = 0.7) +
+    geom_text_repel(size = 3, max.overlaps = 15) +
+    scale_color_manual(values = c(No_Stressor = "#4A90E2", With_Stressor = "#E24A4A")) +
+    labs(title = "PCA: Bipolar Patients with/without Stressors",
+         x = paste0("PC1 (", var_explained[1], "%)"),
+         y = paste0("PC2 (", var_explained[2], "%)")) +
+    theme_bw(base_size = 14)
+)
+dev.off()
+
+# 2C. Hierarchical clustering
+sample_hclust <- hclust(dist(t(expr_matrix[pca_keep, ])), method = "ward.D2")
+pdf("03_sample_clustering.pdf", width = 12, height = 6)
+plot(sample_hclust,
+     labels = paste(sample_metadata$Sample, group, sep = "-"),
+     main = "Hierarchical Clustering of Samples", xlab = "", sub = "", cex = 0.7)
+dev.off()
+
+# ============================================================================
+# 3. DIFFERENTIAL EXPRESSION WITH LIMMA
+# ============================================================================
+sample_metadata$BD_type <- factor(sample_metadata$BD_type)        # 1 = type 1, 2 = type 2
+design <- model.matrix(~ 0 + Group + Age + BD_type, data = sample_metadata)
+colnames(design)[colnames(design) == "GroupNo_Stressor"]   <- "No_Stressor"
+colnames(design)[colnames(design) == "GroupWith_Stressor"] <- "With_Stressor"
+stopifnot(qr(design)$rank == ncol(design))                        
+
+fit  <- lmFit(expr_matrix, design)
+contrast_matrix <- makeContrasts(
+  Stressor_vs_NoStressor = With_Stressor - No_Stressor, levels = design)
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2, trend = TRUE)   
+
+# DE-model QC plots (the array analog of the airway MA plot).
+pdf("05_limma_QC.pdf", width = 12, height = 6)
+par(mfrow = c(1, 2))
+limma::plotMA(fit2, main = "MA plot (Stressor vs No Stressor)")
+abline(h = 0, col = "red")
+limma::plotSA(fit2, main = "Mean-variance trend (eBayes fit)")
+dev.off()
+
+results <- topTable(fit2, coef = "Stressor_vs_NoStressor", number = Inf, sort.by = "P")
+results$Gene_Symbol <- gene_info[rownames(results), "Gene_Symbol"]
+results$Description  <- gene_info[rownames(results), "Description"]
+results <- results[, c("Gene_Symbol", "Description", "logFC", "AveExpr",
+                       "t", "P.Value", "adj.P.Val", "B")]
+
+
+FDR <- 0.05; LFC <- 1
+sig    <- results$adj.P.Val < FDR
+sig_up <- sig & results$logFC >  LFC
+sig_dn <- sig & results$logFC < -LFC
+cat("\n=== DIFFERENTIAL EXPRESSION SUMMARY ===\n")
+cat("Genes analyzed:", nrow(results), "\n")
+cat(sprintf("Significant (adj.P < %.2f): %d\n", FDR, sum(sig, na.rm = TRUE)))
+cat(sprintf("  with |logFC| > %g: %d\n", LFC, sum(sig & abs(results$logFC) > LFC, na.rm = TRUE)))
+cat(sprintf("  up  (logFC >  %g): %d\n", LFC, sum(sig_up, na.rm = TRUE)))
+cat(sprintf("  down(logFC < -%g): %d\n", LFC, sum(sig_dn, na.rm = TRUE)))
+
+write.csv(results, "04_differential_expression_results.csv", row.names = TRUE)
+
+# ============================================================================
+# 4. VOLCANO PLOT
+# ============================================================================
+volcano <- results
+LFC2    <- 2     # high-FC threshold for dark-green (n.s.) genes
+p_line  <- if (any(sig, na.rm = TRUE)) max(results$P.Value[sig], na.rm = TRUE) else 0.01
+naFalse <- function(x) { x[is.na(x)] <- FALSE; x }
+adjP    <- volcano$adj.P.Val
+up    <- naFalse(adjP <  FDR & volcano$logFC >  LFC)
+dn    <- naFalse(adjP <  FDR & volcano$logFC < -LFC)
+green <- naFalse(volcano$logFC > LFC2 & !up)            # logFC > 2 but NOT significant
+
+# --- Significance categories -------------------------------------------------
+volcano$Significance <- "Not Significant"
+volcano$Significance[up]    <- "Upregulated"
+volcano$Significance[dn]    <- "Downregulated"
+volcano$Significance[green] <- "High FC (n.s.)"
+volcano$Significance <- factor(volcano$Significance,
+                               levels = c("Not Significant", "Upregulated", "Downregulated", "High FC (n.s.)"))
+
+# --- Labels: ALL sig up + ALL sig down + green -------------------------------
+named   <- volcano$Gene_Symbol != "Unknown" & !is.na(volcano$Gene_Symbol)
+n_down  <- 20
+dn_pool <- which(dn & named)
+dn_idx  <- head(dn_pool[order(volcano$P.Value[dn_pool])], n_down)   # top 20 most significant
+lab_idx <- unique(c(which(up & named), dn_idx, which(green & named)))
+volcano$Label <- ""
+volcano$Label[lab_idx] <- volcano$Gene_Symbol[lab_idx]
+cat("Labeled -> up:", sum(up & named),
+    "| down:", sum(dn & named),
+    "| green:", sum(green & named),
+    "| total:", length(lab_idx), "\n")
+
+pdf("06_volcano_plot.pdf", width = 11, height = 7)
+p <- ggplot(volcano, aes(x = logFC, y = -log10(P.Value),
+                         color = Significance, label = Label)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_text_repel(max.overlaps = Inf, size = 3, segment.size = 0.2,   # <-- CHANGED: 30 -> Inf
+                  min.segment.length = 0) +
+  scale_color_manual(values = c("Not Significant" = "gray",
+                                "Upregulated"     = "maroon",
+                                "Downregulated"   = "blue",
+                                "High FC (n.s.)"  = "darkgreen")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", alpha = 0.5) +
+  geom_vline(xintercept = c(-2, 2), linetype = "dashed", alpha = 0.3,
+             color = "darkred", linewidth = 0.8) +
+  geom_hline(yintercept = -log10(p_line), linetype = "dashed", alpha = 0.5) +
+  labs(title = "Volcano Plot: With Stressor vs No Stressor",
+       x = "Log2 Fold Change", y = "-Log10(P-value)",
+       caption = "Maroon = Up | Blue = Down | Dark green = logFC > 2 (n.s.)") +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "right",
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.caption = element_text(hjust = 0.5, size = 10))
+print(p)
+dev.off()
+
+# ============================================================================
+# 5. HEATMAP OF TOP GENES
+# ============================================================================
+sig_rows <- rownames(results)[sig]
+top_rows <- if (length(sig_rows) >= 10) head(sig_rows, 50) else head(rownames(results), 50)
+top_expr        <- expr_matrix[top_rows, ]
+top_expr_scaled <- t(scale(t(top_expr)))                    # row z-score
+rownames(top_expr_scaled) <- make.unique(gene_info[top_rows, "Gene_Symbol"])
+col_anno <- data.frame(Group = group, row.names = sample_metadata$Sample)
+
+# --- group annotation colours ---------------
+ann_colors <- list(
+  Group = c("No_Stressor"   = "#1B9E77",   # teal-green
+            "With_Stressor" = "#E6AB02")    # gold/amber
+)
+
+pdf("07_heatmap_top_genes.pdf", width = 12, height = 14)
+pheatmap(top_expr_scaled, annotation_col = col_anno,
+         annotation_colors = ann_colors,                    
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         scale = "none", cluster_rows = TRUE, cluster_cols = TRUE,
+         fontsize = 14, fontsize_row = 14, fontsize_col = 14,
+         main = paste("Top", length(top_rows), "Genes (row z-score)"),
+         breaks = seq(-3, 3, length.out = 101))
+dev.off()
+
+# ============================================================================
+# 6. FUNCTIONAL ENRICHMENT
+# ============================================================================
+# Build a symbol -> Entrez map and a ranked statistic for GSEA.
+gl_sym <- results$t
+names(gl_sym) <- results$Gene_Symbol
+gl_sym <- gl_sym[!names(gl_sym) %in% c("Unknown", "")]
+gl_sym <- gl_sym[!duplicated(names(gl_sym))]
+gl_sym <- sort(gl_sym, decreasing = TRUE)          # symbol-ranked list (for Hallmark)
+
+id_map <- bitr(names(gl_sym), "SYMBOL", "ENTREZID", OrgDb = org.Hs.eg.db)
+ranked <- merge(data.frame(SYMBOL = names(gl_sym), t = gl_sym), id_map, by = "SYMBOL")
+# FIX: drop duplicated Entrez IDs (multi-mapping) BEFORE building the vector;
+#      gseKEGG requires unique names.
+ranked <- ranked[!duplicated(ranked$ENTREZID), ]
+gl_entrez <- sort(setNames(ranked$t, ranked$ENTREZID), decreasing = TRUE)
+
+# ---- 6a. ORA on the DEG list (KEGG + GO), up and down separately -------
+deg_up_sym <- results$Gene_Symbol[sig_up & results$Gene_Symbol != "Unknown"]
+deg_dn_sym <- results$Gene_Symbol[sig_dn & results$Gene_Symbol != "Unknown"]
+to_entrez  <- function(s) na.omit(bitr(unique(s), "SYMBOL", "ENTREZID", org.Hs.eg.db)$ENTREZID)
+universe   <- ranked$ENTREZID
+
+run_ora <- function(symbols, tag) {
+  if (length(symbols) < 5) { cat("ORA skipped (", tag, "): too few genes\n"); return(invisible()) }
+  e <- to_entrez(symbols)
+  kk <- enrichKEGG(e, organism = "hsa", universe = universe, pvalueCutoff = 0.1)
+  go <- enrichGO(e, OrgDb = org.Hs.eg.db, ont = "BP", universe = universe,
+                 keyType = "ENTREZID", pvalueCutoff = 0.1, readable = TRUE)
+  if (!is.null(kk)) write.csv(as.data.frame(kk), paste0("08_ORA_KEGG_", tag, ".csv"), row.names = FALSE)
+  if (!is.null(go)) write.csv(as.data.frame(go), paste0("08_ORA_GO_",   tag, ".csv"), row.names = FALSE)
+  cat("ORA done (", tag, ")\n")
+}
+run_ora(deg_up_sym, "up")
+run_ora(deg_dn_sym, "down")
+
+# ---- 6b. GSEA: KEGG -------------------------------------------------
+kegg_gsea <- gseKEGG(geneList = gl_entrez, organism = "hsa",
+                     minGSSize = 10, maxGSSize = 500,
+                     pvalueCutoff = 1, verbose = FALSE)   # FIX: return all; filter later
+kegg_df <- as.data.frame(kegg_gsea)
+write.csv(kegg_df, "09_GSEA_KEGG_full.csv", row.names = FALSE)
+
+if (nrow(kegg_df) > 0) {
+  pdf("09_GSEA_KEGG_dotplot.pdf", width = 11, height = 9)
+  print(dotplot(kegg_gsea, showCategory = 15, split = ".sign") +
+          ggplot2::facet_grid(. ~ .sign))
+  dev.off()
+}
+
+# ---- 6c. GSEA on Hallmark + GO -----------------------------------------
+hm <- tryCatch(msigdbr(species = "Homo sapiens", collection = "H"),
+               error = function(e) msigdbr(species = "Homo sapiens", category = "H"))
+t2g_hallmark <- hm[, c("gs_name", "gene_symbol")]
+
+hallmark_gsea <- GSEA(gl_sym, TERM2GENE = t2g_hallmark,
+                      minGSSize = 10, maxGSSize = 500, pvalueCutoff = 1, verbose = FALSE)
+write.csv(as.data.frame(hallmark_gsea), "10_GSEA_Hallmark_full.csv", row.names = FALSE)
+
+go_gsea <- gseGO(gl_entrez, OrgDb = org.Hs.eg.db, ont = "BP", keyType = "ENTREZID",
+                 minGSSize = 10, maxGSSize = 500, pvalueCutoff = 1, verbose = FALSE)
+write.csv(as.data.frame(go_gsea), "10_GSEA_GO_BP_full.csv", row.names = FALSE)
+
+if (nrow(as.data.frame(hallmark_gsea)) > 0) {
+  pdf("10_GSEA_Hallmark_dotplot.pdf", width = 11, height = 7)
+  print(dotplot(hallmark_gsea, showCategory = 15, split = ".sign") +
+          ggplot2::facet_grid(. ~ .sign))
+  dev.off()
+}
+
+
+# ============================================================
+#  GO enrichment summary figure — ggplot2 + patchwork
+#  A: GSEA GO-BP (directional NES, top up/down, FDR-marked)
+#  B: ORA on up-regulated DEGs (GO-BP, fold enrichment)
+# ============================================================
+library(dplyr); library(ggplot2); library(stringr); library(patchwork)
+
+# ---- FONT SIZES --------------------------------
+fs_base   <- 16    # overall base size
+fs_axis_t <- 20    # axis TITLES (e.g. "Normalized Enrichment Score")
+fs_axis   <- 20    # axis TICK labels (incl. GO-term names on y-axis)
+fs_title  <- 17    # panel titles (A / B)
+fs_cap    <- 20    # captions
+fs_leg    <- 25    # legend text
+fs_star   <- 8   # FDR star/dagger glyphs
+fs_n      <- 8   # n= count labels (Panel B)
+fs_sup    <- 21    # overall figure title
+# ------------------------------------------------------------
+
+UP <- "#B2182B"; DN <- "#2166AC"; IMM <- "#5A2A82"
+wrap_lab <- function(x, width = 34) str_wrap(x, width = width)
+
+gsea <- read.csv("10_GSEA_GO_BP_full.csv", stringsAsFactors = FALSE)
+ora  <- read.csv("08_ORA_GO_up.csv",       stringsAsFactors = FALSE)
+
+# ---------------- Panel A: GSEA GO-BP ----------------
+gsea_u <- gsea %>%
+  distinct(Description, .keep_all = TRUE) %>%
+  mutate(.k = paste(round(NES, 4), setSize)) %>%
+  distinct(.k, .keep_all = TRUE) %>% select(-.k)
+
+topA <- bind_rows(
+  gsea_u %>% filter(NES > 0) %>% slice_min(pvalue, n = 10, with_ties = FALSE),
+  gsea_u %>% filter(NES < 0) %>% slice_min(pvalue, n = 10, with_ties = FALSE)
+) %>%
+  mutate(
+    dir  = ifelse(NES > 0, "Up in stressor", "Down in stressor"),
+    mark = ifelse(p.adjust < 0.05, "\u2605", ifelse(p.adjust < 0.10, "\u2020", "")),
+    lab  = wrap_lab(Description),
+    lab  = factor(lab, levels = lab[order(NES)])
+  )
+
+pA <- ggplot(topA, aes(NES, lab, fill = dir)) +
+  geom_col(width = 0.72, colour = "black", linewidth = 0.2) +
+  geom_vline(xintercept = 0, linewidth = 0.4) +
+  geom_text(data = ~filter(.x, NES > 0), aes(label = mark), hjust = -0.2, size = fs_star) +
+  geom_text(data = ~filter(.x, NES < 0), aes(label = mark), hjust =  1.2, size = fs_star) +
+  scale_fill_manual(values = c("Up in stressor" = UP, "Down in stressor" = DN), name = NULL) +
+  scale_x_continuous(expand = expansion(mult = 0.16)) +
+  labs(x = "Normalized Enrichment Score (NES)", y = NULL,
+       title = "A  GO Biological Process (GSEA): With_Stressor vs No_Stressor",
+       caption = "\u2605 FDR < 0.05   \u2020 FDR < 0.10   (unmarked: nominal p < 0.05, not FDR-significant)") +
+  theme_classic(base_size = fs_base) +
+  theme(legend.position = "bottom",
+        legend.text  = element_text(size = fs_leg),
+        axis.title.x = element_text(size = fs_axis_t),
+        axis.text.x  = element_text(size = fs_axis),
+        axis.text.y  = element_text(size = fs_axis, lineheight = 0.85),
+        plot.title   = element_text(face = "bold", size = fs_title),
+        plot.caption = element_text(hjust = 0, size = fs_cap, colour = "grey4"))
+
+# ---------------- Panel B: ORA up (immune) ----------------
+topB <- ora %>%
+  distinct(Description, .keep_all = TRUE) %>%
+  slice_max(FoldEnrichment, n = 12, with_ties = FALSE) %>%
+  mutate(lab = wrap_lab(Description),
+         lab = factor(lab, levels = lab[order(FoldEnrichment)]))
+
+pB <- ggplot(topB, aes(FoldEnrichment, lab)) +
+  geom_col(width = 0.72, fill = IMM, colour = "black", linewidth = 0.2) +
+  geom_text(aes(label = paste0("n=", Count)), hjust = -0.2, size = fs_n, colour = "grey2") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.14))) +
+  labs(x = "Fold enrichment", y = NULL,
+       title = "B  Over-representation in up-regulated DEGs (GO-BP) — all immune/innate-immune",
+       caption = "Down-regulated DEGs: no enriched GO-BP terms (n.s.)") +
+  theme_classic(base_size = fs_base) +
+  theme(axis.title.x = element_text(size = fs_axis_t),
+        axis.text.x  = element_text(size = fs_axis),
+        axis.text.y  = element_text(size = fs_axis, lineheight = 0.85),
+        plot.title   = element_text(face = "bold", size = fs_title),
+        plot.caption = element_text(hjust = 1, size = fs_cap, face = "italic", colour = "grey4"))
+
+# ---------------- combine + save ----------------
+fig <- pA / pB + plot_layout(heights = c(1.25, 1.0)) +
+  plot_annotation(title = "GO enrichment summary",
+                  theme = theme(plot.title = element_text(face = "bold", size = fs_sup, hjust = 0.5)))
+
+ggsave("GO_enrichment_summary.pdf", fig, width = 20, height = 20, device = cairo_pdf)
+
+
+# ============================================================================
+# 7. SAMPLE-LEVEL PATHWAY/STATE ACTIVITY (ssGSEA)
+# ============================================================================
+hallmark_list <- split(hm$gene_symbol, hm$gs_name)
+ssgsea_scores <- tryCatch({
+  par <- ssgseaParam(expr_sym, hallmark_list)
+  gsva(par)
+}, error = function(e) {
+  gsva(expr_sym, hallmark_list, method = "ssgsea")  
+})
+
+compare_groups <- function(score_mat, grp, ref = "No_Stressor") {
+  out <- t(apply(score_mat, 1, function(x) {
+    a <- x[grp == ref]; b <- x[grp != ref]
+    tt <- tryCatch(t.test(b, a), error = function(e) list(p.value = NA))
+    c(mean_ref = mean(a), mean_other = mean(b),
+      delta = mean(b) - mean(a), p_value = tt$p.value)
+  }))
+  out <- as.data.frame(out)
+  out$padj <- p.adjust(out$p_value, "BH")
+  out[order(out$p_value), ]
+}
+
+ssgsea_cmp <- compare_groups(ssgsea_scores, group)
+write.csv(ssgsea_cmp, "11_ssGSEA_group_comparison.csv")
+ann_colors <- list(
+  Group = c("No_Stressor"   = "#1B9E77",   # teal-green
+            "With_Stressor" = "#E6AB02")    # gold/amber
+)
+
+pdf("11_ssGSEA_heatmap.pdf", width = 16, height = 12)
+pheatmap(t(scale(t(ssgsea_scores))), annotation_col = col_anno,
+         annotation_colors = ann_colors,
+         color = colorRampPalette(c("navy", "white", "firebrick"))(100),
+         cluster_cols = TRUE,
+         fontsize       = 14,    # <-- group labels (Stress / No Stress) + legend text
+         fontsize_row   = 14,    # pathway names (kept as you had it)
+         main = "ssGSEA Hallmark activity (row z-score)")
+dev.off()
+
+#sepreate groups
+smat <- t(scale(t(ssgsea_scores)))                 
+ord  <- order(col_anno$Group)                      
+smat <- smat[, ord]
+col_anno_ord <- col_anno[ord, , drop = FALSE]
+n_first <- sum(col_anno_ord$Group == levels(col_anno_ord$Group)[1])  
+
+pdf("11_ssGSEA_heatmap.pdf", width = 11, height = 12)
+pheatmap(smat, annotation_col = col_anno_ord,
+         annotation_colors = ann_colors,
+         color = colorRampPalette(c("navy", "white", "firebrick"))(100),
+         cluster_cols = FALSE,           # <-- keep group order, don't interleave
+         cluster_rows = TRUE,            # rows (pathways) can still cluster
+         gaps_col = n_first,             # <-- visual gap between the two groups
+         fontsize_row = 7,
+         main = "ssGSEA Hallmark activity (row z-score)")
+dev.off()
+
+# ============================================================================
+# 8. REGULATORY / SIGNALING INFERENCE (PROGENy + TF activity)
+# ============================================================================
+
+# 8a. PROGENy pathway activity
+expr_sym <- expr_sym[complete.cases(expr_sym), ]          
+
+prog <- progeny(expr_sym, scale = TRUE, organism = "Human", top = 100, perm = 1)
+prog_mat <- t(prog)                                       # pathways x samples
+prog_mat <- prog_mat[apply(prog_mat, 1, function(r) all(is.finite(r))), , drop = FALSE]  
+
+prog_cmp <- compare_groups(prog_mat, group)
+write.csv(prog_cmp, "12_PROGENy_group_comparison.csv")
+
+pdf("12_PROGENy_heatmap.pdf", width = 9, height = 7)
+pheatmap(prog_mat, annotation_col = col_anno,
+         annotation_colors = ann_colors,                  # <-- group colours
+         color = colorRampPalette(c("navy", "white", "firebrick"))(100),
+         cluster_cols = TRUE, main = "PROGENy pathway activity")
+dev.off()
+
+# 8b. TF activity via decoupleR + CollecTRI regulons.
+tf_net <- tryCatch(get_collectri(organism = "human", split_complexes = FALSE),
+                   error = function(e) { message("CollecTRI download failed: ", e$message); NULL })
+
+if (!is.null(tf_net)) {
+  acts <- run_ulm(mat = expr_sym, net = tf_net,
+                  .source = "source", .target = "target", .mor = "mor", minsize = 5)
+  # Reshape ulm scores (z-like) into a TF x sample matrix
+  tf_mat <- acts %>%
+    dplyr::filter(statistic == "ulm") %>%
+    dplyr::select(source, condition, score) %>%        # <-- dplyr::select, not the masked one
+    tidyr::pivot_wider(names_from = condition, values_from = score) %>%
+    tibble::column_to_rownames("source") %>%
+    as.matrix()
+  tf_mat <- tf_mat[, sample_metadata$Sample, drop = FALSE]   
+  
+  tf_cmp <- compare_groups(tf_mat, group)
+  write.csv(tf_cmp, "13_TF_activity_group_comparison.csv")
+  
+  # Plot the 25 TFs with the largest group difference
+  top_tf <- head(rownames(tf_cmp[order(-abs(tf_cmp$delta)), ]), 25)
+  pdf("13_TF_activity_heatmap.pdf", width = 10, height = 9)
+  pheatmap(tf_mat[top_tf, ], annotation_col = col_anno,
+           annotation_colors = ann_colors,
+           color = colorRampPalette(c("navy", "white", "firebrick"))(100),
+           cluster_cols = TRUE,
+           fontsize     = 14,   # <-- group labels (Stress / No Stress) + legend
+           fontsize_row = 14,    # TF names (kept small for the 25 rows)
+           main = "TF activity (decoupleR/CollecTRI, top 25 by |delta|)")
+  dev.off()
+}
+
+# ============================================================================
+# 9. SINGLE-GENE FOLLOW-UP: BTNL3
+# ============================================================================
+btnl3_idx <- which(MA$`Gene Symbol` == "BTNL3")
+
+if (length(btnl3_idx) == 0) {
+  cat("BTNL3 not found. Related BTN genes:\n")
+  print(unique(grep("BTN", MA$`Gene Symbol`, value = TRUE, ignore.case = TRUE)))
+} else {
+  # Coerce via matrix and average across probes if BTNL3 maps to >1 row.
+  m <- matrix(as.numeric(as.matrix(MA[btnl3_idx, 1:29])), nrow = length(btnl3_idx))
+  btnl3_values <- colMeans(m, na.rm = TRUE)
+  
+  btnl3_data <- data.frame(
+    Sample = new_names,
+    Expression = btnl3_values,
+    Group = factor(ifelse(grepl("^0_", new_names), "No Stressor", "With Stressor"),
+                   levels = c("No Stressor", "With Stressor")))
+  
+  summary_stats <- btnl3_data %>%
+    group_by(Group) %>%
+    summarise(N = n(), Mean = mean(Expression), SD = sd(Expression),
+              Median = median(Expression), .groups = "drop")
+  print(summary_stats)
+  
+  m0 <- summary_stats$Mean[summary_stats$Group == "No Stressor"]
+  m1 <- summary_stats$Mean[summary_stats$Group == "With Stressor"]
+  s0 <- summary_stats$SD[summary_stats$Group == "No Stressor"]
+  s1 <- summary_stats$SD[summary_stats$Group == "With Stressor"]
+  n0 <- summary_stats$N[summary_stats$Group == "No Stressor"]
+  n1 <- summary_stats$N[summary_stats$Group == "With Stressor"]
+  
+  log2fc    <- m1 - m0                                    # raw (unadjusted) mean difference
+  sd_pooled <- sqrt(((n0 - 1) * s0^2 + (n1 - 1) * s1^2) / (n0 + n1 - 2))
+  cohens_d  <- log2fc / sd_pooled
+  
+  # Moderated limma stats 
+  limma_rows <- intersect(paste0("Gene_", btnl3_idx), rownames(results))
+  if (length(limma_rows) > 0) {
+    cat("\nBTNL3 limma (moderated) stats:\n")
+    print(results[limma_rows, c("logFC", "t", "P.Value", "adj.P.Val")])
+  }
+  # adjusted logFC from the DE model 
+  limma_logfc <- if (length(limma_rows) > 0) mean(results[limma_rows, "logFC"], na.rm = TRUE) else NA
+  
+  welch <- t.test(Expression ~ Group, data = btnl3_data)
+  cat(sprintf("limma logFC (adj.) = %.3f | raw \u0394mean = %.3f | Cohen's d = %.3f | Welch p = %.4g\n",
+              limma_logfc, log2fc, cohens_d, welch$p.value))
+  
+  p <- ggplot(btnl3_data, aes(Group, Expression, fill = Group)) +
+    geom_violin(alpha = 0.3, trim = FALSE, color = "black") +
+    geom_boxplot(width = 0.3, alpha = 0.7, outlier.shape = NA) +
+    geom_jitter(width = 0.15, size = 3, alpha = 0.7, color = "black") +
+    stat_summary(fun = mean, geom = "point", shape = 23, size = 4,
+                 fill = "yellow", color = "black", stroke = 1.5) +
+    scale_fill_manual(values = c("No Stressor" = "#4A90E2", "With Stressor" = "#E24A4A")) +
+    labs(title = "BTNL3 Expression: Bipolar Disorder Patients",
+         subtitle = sprintf("limma logFC (adj.) = %.3f | raw \u0394mean = %.3f | Cohen's d = %.3f | Welch p = %.3g",
+                            limma_logfc, log2fc, cohens_d, welch$p.value),
+         x = "", y = "Log2 Expression") +
+    theme_bw(base_size = 14) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5), legend.position = "none")
+  ggsave("14_BTNL3_expression.pdf", p, width = 9, height = 7)
+  write.csv(btnl3_data, "14_BTNL3_expression_values.csv", row.names = FALSE)
+}
+
+# ============================================================================
+# 10. Entrez ID -> Symbol conversion for supplied gene sets
+# ============================================================================
+gene_sets <- list(
+  set1 = c(6144,6206,6232,6209,6187,6205,6158,6171,6136,3661,6222,6160,6134,6203,6230,6142),
+  set2 = c(6144,6206,6232,6209,6187,6205,6158,6171,51650,6136,6222,6160,116540,6134,6203,6230,6142),
+  set3 = c(128866,3107,3105,3106,5878,81873,3133,3134,6455,84612),
+  set4 = c(5709,3107,10454,3105,3106,3661,3133,3134,7979),
+  set5 = c(5709,177,7477,8471,8325,4696,56901,7979,4513,514,208,5605))
+gene_symbols <- lapply(gene_sets, function(ids)
+  bitr(ids, "ENTREZID", "SYMBOL", org.Hs.eg.db))
+print(gene_symbols)
+
+cat("\n=== Analysis complete ===\n")
+
+#SUMMARY TABLE
+
+library(tableone)
+
+meta <- as.data.frame(read_excel("MA_metadata.xlsx"))   
+
+num_vars <- c("Age", "Age_of_onset", "Depressive_episode", "Manic_episode",
+              "Hypomanic_episode", "Total_episode", "Disease_duration")
+cat_vars <- c("Sex", "BD_type", "Education", "Marital_status")
+
+meta[num_vars] <- lapply(meta[num_vars], as.numeric)
+meta$Sex     <- factor(meta$Sex,     levels = c(0, 1), labels = c("Male", "Female"))
+meta$BD_type <- factor(meta$BD_type, levels = c(1, 2), labels = c("Type 1", "Type 2"))
+
+tab1 <- CreateTableOne(vars = c(num_vars, cat_vars), strata = "Group",
+                       factorVars = cat_vars, data = meta)
+print(tab1, showAllLevels = TRUE, exact = cat_vars)
